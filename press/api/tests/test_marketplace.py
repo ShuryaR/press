@@ -337,6 +337,9 @@ class TestAPIMarketplace(FrappeTestCase):
 		frappe.set_user(self.team.user)
 		self.assertIsNotNone(subscriptions())
 
+	@patch(
+		"press.press.doctype.marketplace_app.marketplace_app.validate_frappe_version_for_branch", new=Mock()
+	)
 	def test_change_branch(self):
 		old_branch = self.app_source.branch
 		change_branch(self.marketplace_app.name, self.app_source.name, "Version 14", "develop")
@@ -360,7 +363,7 @@ class TestAPIMarketplace(FrappeTestCase):
 	def test_branches(self):
 		frappe.set_user(self.team.user)
 		responses.get(
-			url=f"https://api.github.com/repos/{self.app_source.repository_owner}/{self.app_source.repository}/branches?per_page=100",
+			url=f"https://api.github.com/repos/{self.app_source.repository_owner}/{self.app_source.repository}/branches?per_page=100&page=1",
 			json=PAYLOAD,
 			status=200,
 			headers={},
