@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import frappe
 import frappe.utils
@@ -27,6 +28,7 @@ class ProductTrial(Document):
 		from press.press.doctype.site.site import Site
 		from press.saas.doctype.hybrid_pool_item.hybrid_pool_item import HybridPoolItem
 		from press.saas.doctype.product_trial_app.product_trial_app import ProductTrialApp
+		from press.saas.doctype.product_trial_help_text.product_trial_help_text import ProductTrialHelpText
 
 		apps: DF.Table[ProductTrialApp]
 		domain: DF.Link
@@ -36,6 +38,7 @@ class ProductTrial(Document):
 		email_subject: DF.Data
 		enable_hybrid_pooling: DF.Check
 		enable_pooling: DF.Check
+		help_texts: DF.Table[ProductTrialHelpText]
 		hybrid_pool_rules: DF.Table[HybridPoolItem]
 		logo: DF.AttachImage | None
 		published: DF.Check
@@ -57,6 +60,7 @@ class ProductTrial(Document):
 		"trial_days",
 		"trial_plan",
 		"redirect_to_after_login",
+		"help_texts",
 	)
 
 	def get_doc(self, doc):
@@ -64,7 +68,6 @@ class ProductTrial(Document):
 			frappe.throw("Not permitted")
 
 		doc.proxy_servers = self.get_proxy_servers_for_available_clusters()
-		doc.prefilled_subdomain = self.get_unique_site_name()
 		return doc
 
 	def validate(self):
@@ -91,7 +94,7 @@ class ProductTrial(Document):
 		self,
 		subdomain: str,
 		domain: str,
-		team: str,
+		team: str | None = None,
 		cluster: str | None = None,
 		account_request: str | None = None,
 	):
@@ -105,8 +108,7 @@ class ProductTrial(Document):
 		standby_site = self.get_standby_site(cluster, account_request)
 
 		trial_end_date = frappe.utils.add_days(None, self.trial_days or 14)
-		site = None
-		agent_job_name = None
+		agent_job_name: str | None = None
 		plan = self.trial_plan
 
 		if standby_site:
@@ -230,13 +232,17 @@ class ProductTrial(Document):
 			"Cluster", {"name": ("in", clusters), "public": 1}, order_by="name asc", pluck="name"
 		)
 
+	@staticmethod
 	def get_preferred_site(filters) -> str | None:
-		sites = frappe.db.get_all(
+		sites = frappe.db.get_values(
 			"Site",
 			filters=filters,
-			pluck="name",
-			order_by="creation asc",
-			limit=10,
+			fieldname="name",
+			order_by="status,standby_for,creation asc",
+			limit=3,
+			for_update=True,
+			skip_locked=True,
+			pluck=True,
 		)
 		if not sites:
 			return None
@@ -316,7 +322,7 @@ class ProductTrial(Document):
 			for rule in self.hybrid_pool_rules:
 				self._create_standby_sites(cluster, rule)
 
-	def _create_standby_sites(self, cluster: str, rule: dict | None = None):
+	def _create_standby_sites(self, cluster: str, rule: HybridPoolItem | None = None):
 		if rule and rule.preferred_cluster and rule.preferred_cluster != cluster:
 			return
 
@@ -333,7 +339,7 @@ class ProductTrial(Document):
 			self.create_standby_site(cluster, rule)
 			frappe.db.commit()
 
-	def create_standby_site(self, cluster: str, rule: dict | None = None):
+	def create_standby_site(self, cluster: str, rule: HybridPoolItem | None = None):
 		from frappe.core.utils import find
 
 		administrator = frappe.db.get_value("Team", {"user": "Administrator"}, "name")
@@ -367,40 +373,90 @@ class ProductTrial(Document):
 		site.insert(ignore_permissions=True)
 
 	def get_standby_sites_count(self, cluster: str, hybrid_for: str | None = None):
-		active_standby_sites = frappe.db.count(
-			"Site",
-			{
-				"cluster": cluster,
-				"is_standby": 1,
-				"standby_for_product": self.name,
-				"status": "Active",
-				"hybrid_for": hybrid_for,
-			},
+		one_hour_ago = frappe.utils.add_to_date(None, hours=-1)
+		Site = frappe.qb.DocType("Site")
+		query = (
+			frappe.qb.from_(Site)
+			.select(Site.name)
+			.distinct()
+			.where(
+				(Site.cluster == cluster) & (Site.is_standby == 1) & (Site.standby_for_product == self.name)
+			)
 		)
-		# sites that are created in the last hour
-		recent_standby_sites = frappe.db.count(
-			"Site",
-			{
-				"cluster": cluster,
-				"is_standby": 1,
-				"standby_for_product": self.name,
-				"status": ("not in", ["Archived", "Suspended"]),
-				"creation": (">", frappe.utils.add_to_date(None, hours=-1)),
-				"hybrid_for": hybrid_for,
-			},
+
+		if hybrid_for is None:
+			query = query.where(Site.hybrid_for.isnull())
+		else:
+			query = query.where(Site.hybrid_for == hybrid_for)
+
+		query = query.where(
+			(Site.status == "Active")
+			| ((Site.creation > one_hour_ago) & (Site.status.notin(["Archived", "Suspended"])))
 		)
-		return active_standby_sites + recent_standby_sites
+		standby_sites = query.run(pluck=True)
+		return len(standby_sites)
+
+	def get_prefilled_subdomain(self, account_request: str | None = None) -> str:
+		"""
+		Get the prefilled subdomain based on the email domain of the account request.
+		If the email domain belongs to a free email provider, generate a unique site name instead.
+		"""
+		if not account_request:
+			return self.get_unique_site_name()
+
+		email = frappe.db.get_value("Account Request", account_request, "email")
+		free_email_providers = {
+			"gmail.com",
+			"yahoo.com",
+			"hotmail.com",
+			"outlook.com",
+			"aol.com",
+			"icloud.com",
+			"mail.com",
+			"zoho.com",
+			"protonmail.com",
+			"gmx.com",
+			"yandex.com",
+			"live.com",
+			"me.com",
+			"msn.com",
+			"googlemail.com",
+			"163.com",
+			"sina.com",
+			"qq.com",
+			"naver.com",
+			"hanmail.net",
+			"daum.net",
+			"nate.com",
+			"yahoo.co.jp",
+			"yahoo.co.in",
+			"yahoo.co.uk",
+			"hotmail.co.uk",
+			"live.co.uk",
+			"outlook.in",
+			"rediffmail.com",
+		}
+
+		if email and "@" in email:
+			domain = email.split("@")[1].lower()
+			if domain not in free_email_providers:
+				suggested_subdomain = domain.split(".")[0]
+				if len(suggested_subdomain) < 5:
+					suggested_subdomain += f"-{domain.split('.')[1]}"
+
+				return suggested_subdomain
+
+		return self.get_unique_site_name()
 
 	def get_unique_site_name(self):
-		subdomain = f"{self.name}-{generate_random_name(segment_length=3, num_segments=2)}"
 		filters = {
-			"subdomain": subdomain,
+			"subdomain": f"{self.name}-{generate_random_name(segment_length=3, num_segments=2)}",
 			"domain": self.domain,
 			"status": ("!=", "Archived"),
 		}
 		while frappe.db.exists("Site", filters):
-			subdomain = f"{self.name}-{generate_random_name(segment_length=3, num_segments=2)}"
-		return subdomain
+			filters["subdomain"] = f"{self.name}-{generate_random_name(segment_length=3, num_segments=2)}"
+		return filters["subdomain"]
 
 	def get_server_from_cluster(self, cluster):
 		"""Return the server with the least number of standby sites in the cluster"""
@@ -460,7 +516,7 @@ def create_free_app_subscription(app: str, site: str | None = None):
 
 def get_app_subscriptions_site_config(apps: list[str], site: str | None = None) -> dict:
 	subscriptions = []
-	site_config = {}
+	site_config: dict[str, Any] = {}
 
 	for app in apps:
 		if not (s := create_free_app_subscription(app, site)):
@@ -563,13 +619,15 @@ def sync_product_site_users():
 		)
 
 
-def send_suspend_mail(site: str, product: str) -> None:
+def send_suspend_mail(site_name: str, product_name: str) -> None:
 	"""Send suspension mail to the site owner."""
 
-	site = frappe.db.get_value("Site", site, ["team", "trial_end_date", "name", "host_name"], as_dict=True)
+	site = frappe.db.get_value(
+		"Site", site_name, ["team", "trial_end_date", "name", "host_name"], as_dict=True
+	)
 	product = frappe.db.get_value(
 		"Product Trial",
-		product,
+		product_name,
 		["title", "suspension_email_subject", "suspension_email_content", "email_full_logo", "logo"],
 		as_dict=True,
 	)
@@ -584,12 +642,27 @@ def send_suspend_mail(site: str, product: str) -> None:
 	)
 	recipient = frappe.get_value("Team", site.team, "user")
 	args = {}
-
+	inline_images = []
 	# TODO: enable it when we use the full logo
 	# if product.email_full_logo:
 	# 	args.update({"image_path": get_url(product.email_full_logo, True)})
 	if product.logo:
 		args.update({"logo": get_url(product.logo, True), "title": product.title})
+		try:
+			logo_name = product.logo[1:]
+			args.update({"logo_name": logo_name})
+			with open(frappe.utils.get_site_path("public", logo_name), "rb") as logo_file:
+				inline_images.append(
+					{
+						"filename": logo_name,
+						"filecontent": logo_file.read(),
+					}
+				)
+		except Exception as ex:
+			log_error(
+				"Error reading logo for inline images in email",
+				data=ex,
+			)
 	if product.email_account:
 		sender = frappe.get_value("Email Account", product.email_account, "email_id")
 
@@ -598,12 +671,17 @@ def send_suspend_mail(site: str, product: str) -> None:
 		"product": product,
 	}
 	message = frappe.render_template(product.suspension_email_content, context)
-	args.update({"message": message})
-
+	args.update(
+		{
+			"message": message,
+			"preview_text": f"Your {product.title} site has expired. Please update your billing to activate your site.",
+		}
+	)
 	frappe.sendmail(
 		sender=sender,
 		recipients=recipient,
 		subject=subject,
 		template="product_trial_email",
 		args=args,
+		inline_images=inline_images,
 	)
