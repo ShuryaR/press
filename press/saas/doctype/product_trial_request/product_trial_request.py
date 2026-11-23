@@ -16,6 +16,7 @@ from frappe.utils.telemetry import init_telemetry
 
 from press.api.client import dashboard_whitelist
 from press.press.doctype.root_domain.root_domain import get_domains
+from press.press.doctype.telegram_message.telegram_message import TelegramMessage
 from press.utils import log_error, validate_subdomain
 
 if TYPE_CHECKING:
@@ -60,22 +61,12 @@ class ProductTrialRequest(Document):
 
 	agent_job_step_to_frontend_step = {  # noqa: RUF012
 		"New Site": {
-			"New Site": "Building Site",
-			"Install Apps": "Installing Apps",
-			"Update Site Configuration": "Updating Configuration",
-			"Enable Scheduler": "Finalizing Site",
-			"Bench Setup Nginx": "Finalizing Site",
-			"Reload Nginx": "Just a moment",
-		},
-		"Rename Site": {
-			"Enable Maintenance Mode": "Starting",
-			"Wait for Enqueued Jobs": "Starting",
-			"Update Site Configuration": "Preparing Site",
-			"Rename Site": "Preparing Site",
-			"Bench Setup NGINX": "Preparing Site",
-			"Reload NGINX": "Finalizing Site",
-			"Disable Maintenance Mode": "Finalizing Site",
-			"Enable Scheduler": "Just a moment",
+			"New Site": "Creating your site",
+			"Install Apps": "Installing apps",
+			"Update Site Configuration": "Configuring your site",
+			"Enable Scheduler": "Finalizing your setup",
+			"Bench Setup Nginx": "Finalizing your setup",
+			"Reload Nginx": "Almost there",
 		},
 	}
 
@@ -163,7 +154,14 @@ class ProductTrialRequest(Document):
 					# this is to create a webhook record in the site
 					# so that the user records can be synced with press
 					site: Site = frappe.get_doc("Site", self.site)
-					site.create_sync_user_webhook()
+					try:
+						site.create_sync_user_webhook()
+					except Exception:
+						log_error(
+							title="Sync User Webhook Creation Failed",
+							reference_doctype=self.doctype,
+							reference_name=self.name,
+						)
 
 	@frappe.whitelist()
 	def get_setup_wizard_payload(self):
@@ -295,7 +293,9 @@ class ProductTrialRequest(Document):
 				return {"progress": 100, "current_step": self.status}
 			if self.status == "Adding Domain":
 				return {"progress": 90, "current_step": self.status}
-			return {"progress": 80, "current_step": self.status}
+			current_progress = max(current_progress, 30)
+			progress = current_progress + 0.4
+			return {"progress": progress, "current_step": self.status}
 
 		if status == "Running":
 			steps = frappe.db.get_all(
@@ -390,3 +390,97 @@ def expire_long_pending_trial_requests():
 		"Expired",
 		update_modified=False,
 	)
+
+
+def gather_stats(time_ago):
+	stats = {
+		"total_trials": 0,
+		"failed_trials": 0,
+		"succeeded_trials": 0,
+		"expired_trials": 0,
+		"pending_trials": 0,
+		"app_wise_failures": {},
+		"total_creation_time": 0,
+		"valid_trials_with_timing": 0,
+	}
+	try:
+		trial_requests = frappe.db.get_all(
+			"Product Trial Request",
+			{"creation": (">", time_ago), "owner": ("not like", "fc-signup-test_%")},
+			["name", "status", "product_trial", "site_creation_started_on", "site_creation_completed_on"],
+		)
+		stats["total_trials"] = len(trial_requests)
+		for req in trial_requests:
+			if req.status == "Error":
+				stats["failed_trials"] = stats["failed_trials"] + 1
+				stats["app_wise_failures"][req.product_trial] = (
+					stats["app_wise_failures"].get(req.product_trial, 0) + 1
+				)
+			elif req.status == "Site Created":
+				stats["succeeded_trials"] = stats["succeeded_trials"] + 1
+			elif req.status == "Expired":
+				stats["expired_trials"] = stats["expired_trials"] + 1
+			elif req.status == "Pending":
+				stats["pending_trials"] = stats["pending_trials"] + 1
+
+			# avg time taken for the day
+			if req.site_creation_started_on and req.site_creation_completed_on:
+				start_to_end_time = (
+					req.site_creation_completed_on - req.site_creation_started_on
+				).total_seconds()
+				stats["total_creation_time"] += start_to_end_time
+				stats["valid_trials_with_timing"] += 1
+		return stats
+	except Exception as e:
+		log_error(
+			title="Error gathering stats in Product Trial Request",
+			data=e,
+		)
+		return None
+
+
+def push_stats_message(stats, message):
+	if stats:
+		message += f"**Total Trials**: {stats['total_trials']}\n\n"
+		message = (
+			message
+			+ f"[Succeeded trial requests](https://frappecloud.com/app/product-trial-request?status=Site+Created): {stats['succeeded_trials']}\n"
+		)
+		message = (
+			message
+			+ f"[Failed trial requests](https://frappecloud.com/app/product-trial-request?status=Error): {stats['failed_trials']}\n"
+		)
+
+		# add app failure counts to message
+		if stats["app_wise_failures"]:
+			message += "**Application Failure Breakdown:**\n"
+			for app, count in stats["app_wise_failures"].items():
+				message = message + f"{app} failed {count!s} time(s)\n"
+
+		if stats["valid_trials_with_timing"] > 0:
+			avg_time = stats["total_creation_time"] / stats["valid_trials_with_timing"]
+			message += f"**Average Site Creation Time**: {avg_time:.2f}s\n"
+		else:
+			message += "**Average Site Creation Time**: No data available\n"
+		TelegramMessage.enqueue(message=message, topic="Signups")
+
+
+def gather_weekly_stats():
+	one_week_ago = frappe.utils.add_to_date(None, days=-7)
+	message = "*Weekly Signup stats*\n\n"
+	stats = gather_stats(one_week_ago)
+	push_stats_message(stats, message)
+
+
+def gather_daily_stats():
+	one_day_ago = frappe.utils.add_to_date(None, days=-1)
+	message = "*Daily Signup stats*\n\n"
+	stats = gather_stats(one_day_ago)
+	push_stats_message(stats, message)
+
+
+def gather_hourly_stats():
+	one_hour_ago = frappe.utils.add_to_date(None, hours=-1)
+	message = "*Hourly Signup stats*\n\n"
+	stats = gather_stats(one_hour_ago)
+	push_stats_message(stats, message)
